@@ -1,4 +1,4 @@
-use thermal_plant_model::{ThermalInput, ThermalParams, ThermalState, rk2_step};
+use thermal_plant_model::{SimulationConfig, ThermalInput, rk2_step};
 
 fn main() {
     const DT: f32 = 0.1;
@@ -6,27 +6,14 @@ fn main() {
     const HEATING_MINUTES: usize = 60;
     const TOTAL_MINUTES: usize = 120;
 
-    let params = ThermalParams {
-        heater_capacity: 100.0,
-        sample_capacity: 200.0,
-        room_capacity: 300_000.0,
-        coupling: 2.0,
-        heater_loss: 1.0,
-        sample_loss: 0.5,
-        room_loss: 20.0,
-        heater_radiation: 4.0e-10,
-        sample_radiation: 2.0e-10,
-        max_heater_power: 100.0,
-    };
+    let config = SimulationConfig::default();
+    config.validate().expect("Invalid simulation configuration");
 
-    let mut state = ThermalState {
-        heater_temp: 20.0,
-        sample_temp: 20.0,
-        room_temp: 20.0,
-    };
+    let params = config.parameters;
+    let mut state = config.initial_state;
 
     let mut input = ThermalInput {
-        background_temp: 20.0,
+        background_temp: config.background_temp,
         heater_command: 1.0,
     };
 

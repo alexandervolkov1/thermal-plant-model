@@ -31,6 +31,81 @@ pub struct ThermalInput {
     pub heater_command: f32,
 }
 
+/// Physical parameters and initial conditions for a simulation run.
+#[derive(Clone, Copy)]
+pub struct SimulationConfig {
+    pub parameters: ThermalParams,
+    pub initial_state: ThermalState,
+    pub background_temp: f32,
+}
+
+impl Default for SimulationConfig {
+    fn default() -> Self {
+        Self {
+            parameters: ThermalParams {
+                heater_capacity: 100.0,
+                sample_capacity: 200.0,
+                room_capacity: 300_000.0,
+                coupling: 2.0,
+                heater_loss: 1.0,
+                sample_loss: 0.5,
+                room_loss: 20.0,
+                heater_radiation: 4.0e-10,
+                sample_radiation: 2.0e-10,
+                max_heater_power: 100.0,
+            },
+            initial_state: ThermalState {
+                heater_temp: 20.0,
+                sample_temp: 20.0,
+                room_temp: 20.0,
+            },
+            background_temp: 20.0,
+        }
+    }
+}
+
+impl SimulationConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let p = &self.parameters;
+
+        let capacities = [p.heater_capacity, p.sample_capacity, p.room_capacity];
+
+        if !capacities.iter().all(|x| x.is_finite() && *x > 0.0) {
+            return Err("Heat capacities must be finite and positive");
+        }
+
+        let coefficients = [
+            p.coupling,
+            p.heater_loss,
+            p.sample_loss,
+            p.room_loss,
+            p.heater_radiation,
+            p.sample_radiation,
+        ];
+
+        if !coefficients.iter().all(|x| x.is_finite() && *x >= 0.0) {
+            return Err("Heat transfer coefficients must be finite and nonnegative");
+        }
+
+        if !p.max_heater_power.is_finite() || p.max_heater_power <= 0.0 {
+            return Err("Maximum heater power must be finite and positive");
+        }
+
+        let temperatures = [
+            self.initial_state.heater_temp,
+            self.initial_state.sample_temp,
+            self.initial_state.room_temp,
+            self.background_temp,
+        ];
+
+        if !temperatures.iter().all(|t| t.is_finite() && *t > -273.15) {
+            return Err("Temperatures must be finite and above absolute zero");
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ThermalDerivative {
     pub heater_temp_rate: f32,
@@ -133,18 +208,7 @@ mod tests {
     use super::*;
 
     fn parameters() -> ThermalParams {
-        ThermalParams {
-            heater_capacity: 100.0,
-            sample_capacity: 200.0,
-            room_capacity: 300_000.0,
-            coupling: 2.0,
-            heater_loss: 1.0,
-            sample_loss: 0.5,
-            room_loss: 20.0,
-            heater_radiation: 4.0e-10,
-            sample_radiation: 2.0e-10,
-            max_heater_power: 100.0,
-        }
+        SimulationConfig::default().parameters
     }
 
     #[test]
@@ -308,5 +372,32 @@ mod tests {
             + f64::from(params.room_capacity) * f64::from(rates.room_temp_rate);
 
         assert!(energy_rate.abs() < 1e-3);
+    }
+
+    #[test]
+    fn default_configuration_is_valid() {
+        let config = SimulationConfig::default();
+
+        assert_eq!(config.validate(), Ok(()));
+        assert_eq!(config.initial_state.heater_temp, 20.0);
+        assert_eq!(config.initial_state.sample_temp, 20.0);
+        assert_eq!(config.initial_state.room_temp, 20.0);
+        assert_eq!(config.parameters.max_heater_power, 100.0);
+    }
+
+    #[test]
+    fn rejects_invalid_configuration() {
+        let mut config = SimulationConfig::default();
+
+        config.parameters.room_capacity = 0.0;
+        assert!(config.validate().is_err());
+
+        config.parameters.room_capacity = 300_000.0;
+        config.parameters.coupling = -1.0;
+        assert!(config.validate().is_err());
+
+        config.parameters.coupling = 2.0;
+        config.background_temp = f32::NAN;
+        assert!(config.validate().is_err());
     }
 }
