@@ -5,6 +5,8 @@ mod random;
 use random::XorShift32;
 
 pub const MODEL_STEP_SECONDS: f32 = 0.1;
+const POWER_TARGET_INTERVAL_STEPS: u16 = 100;
+const POWER_SMOOTHING: f32 = 0.01;
 
 #[derive(Clone, Copy)]
 pub struct ThermalState {
@@ -44,6 +46,7 @@ pub struct SimulationConfig {
     pub background_temp: f32,
     pub seed: u32,
     pub parameter_spread: f32,
+    pub heater_power_fluctuation: f32,
 }
 
 impl Default for SimulationConfig {
@@ -69,6 +72,7 @@ impl Default for SimulationConfig {
             background_temp: 20.0,
             seed: 1,
             parameter_spread: 0.0,
+            heater_power_fluctuation: 0.0,
         }
     }
 }
@@ -115,6 +119,10 @@ impl SimulationConfig {
             return Err("Parameter spread must be between 0 and 0.10");
         }
 
+        if !(0.0..=0.10).contains(&self.heater_power_fluctuation) {
+            return Err("Heater power fluctuation must be between 0 and 0.10");
+        }
+
         Ok(())
     }
 }
@@ -150,6 +158,11 @@ pub struct ThermalPlant {
     parameters: ThermalParams,
     state: ThermalState,
     input: ThermalInput,
+    heater_power_fluctuation: f32,
+    power_rng: XorShift32,
+    power_offset: f32,
+    power_target: f32,
+    steps_until_power_target: u16,
 }
 
 impl ThermalPlant {
@@ -171,6 +184,11 @@ impl ThermalPlant {
                 background_temp: config.background_temp,
                 heater_command: 0.0,
             },
+            heater_power_fluctuation: config.heater_power_fluctuation,
+            power_rng: XorShift32::new(config.seed ^ 0x9E37_79B9),
+            power_offset: 0.0,
+            power_target: 0.0,
+            steps_until_power_target: 0,
         })
     }
 
@@ -192,7 +210,30 @@ impl ThermalPlant {
     }
 
     pub fn step(&mut self) {
-        self.state = rk2_step(self.state, self.parameters, self.input, MODEL_STEP_SECONDS);
+        if self.heater_power_fluctuation > 0.0 {
+            if self.steps_until_power_target == 0 {
+                self.power_target =
+                    self.heater_power_fluctuation * self.power_rng.next_signed_unit();
+
+                self.steps_until_power_target = POWER_TARGET_INTERVAL_STEPS;
+            }
+
+            self.steps_until_power_target -= 1;
+
+            self.power_offset += POWER_SMOOTHING * (self.power_target - self.power_offset);
+        }
+
+        let effective_parameters = ThermalParams {
+            max_heater_power: self.parameters.max_heater_power * (1.0 + self.power_offset),
+            ..self.parameters
+        };
+
+        self.state = rk2_step(
+            self.state,
+            effective_parameters,
+            self.input,
+            MODEL_STEP_SECONDS,
+        );
     }
 }
 
@@ -610,6 +651,80 @@ mod tests {
         assert_eq!(
             plant.parameters.room_capacity,
             config.parameters.room_capacity
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_power_fluctuation() {
+        for invalid in [-0.01, 0.11, f32::NAN] {
+            let config = SimulationConfig {
+                heater_power_fluctuation: invalid,
+                ..SimulationConfig::default()
+            };
+
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn power_fluctuation_is_reproducible() {
+        let config = SimulationConfig {
+            seed: 12345,
+            heater_power_fluctuation: 0.03,
+            ..SimulationConfig::default()
+        };
+
+        let mut first = ThermalPlant::new(config).unwrap();
+        let mut second = ThermalPlant::new(config).unwrap();
+
+        first.set_power_percent(75.0).unwrap();
+        second.set_power_percent(75.0).unwrap();
+
+        for _ in 0..600 {
+            let _ = first.temperatures();
+            let _ = first.temperatures();
+
+            first.step();
+            second.step();
+        }
+
+        let a = first.temperatures();
+        let b = second.temperatures();
+
+        assert_eq!(a.heater_temp.to_bits(), b.heater_temp.to_bits());
+        assert_eq!(a.sample_temp.to_bits(), b.sample_temp.to_bits());
+        assert_eq!(a.room_temp.to_bits(), b.room_temp.to_bits());
+
+        assert_eq!(first.power_percent(), 75.0);
+    }
+
+    #[test]
+    fn different_seeds_change_heating() {
+        let config = SimulationConfig {
+            seed: 12345,
+            heater_power_fluctuation: 0.03,
+            ..SimulationConfig::default()
+        };
+
+        let mut first = ThermalPlant::new(config).unwrap();
+
+        let mut second = ThermalPlant::new(SimulationConfig {
+            seed: 67890,
+            ..config
+        })
+        .unwrap();
+
+        first.set_power_percent(100.0).unwrap();
+        second.set_power_percent(100.0).unwrap();
+
+        for _ in 0..600 {
+            first.step();
+            second.step();
+        }
+
+        assert_ne!(
+            first.temperatures().heater_temp.to_bits(),
+            second.temperatures().heater_temp.to_bits()
         );
     }
 }
