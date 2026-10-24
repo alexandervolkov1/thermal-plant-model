@@ -118,3 +118,115 @@ fn radiative_loss(temperature: f32, ambient_temperature: f32, coefficient: f32) 
 
     coefficient * (temp_k4 - amb_temp_k4)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parameters() -> ThermalParams {
+        ThermalParams {
+            heater_capacity: 100.0,
+            sample_capacity: 200.0,
+            coupling: 2.0,
+            heater_loss: 1.0,
+            sample_loss: 0.5,
+            heater_radiation: 4.0e-10,
+            sample_radiation: 2.0e-10,
+            max_heater_power: 100.0,
+        }
+    }
+
+    #[test]
+    fn equilibrium_without_heating() {
+        let state = ThermalState {
+            heater_temp: 20.0,
+            sample_temp: 20.0,
+        };
+
+        let input = ThermalInput {
+            ambient_temp: 20.0,
+            heater_command: 0.0,
+        };
+
+        let next = rk2_step(state, parameters(), input, 0.1);
+
+        assert_eq!(next.heater_temp, 20.0);
+        assert_eq!(next.sample_temp, 20.0);
+    }
+
+    #[test]
+    fn heating_without_losses() {
+        let params = ThermalParams {
+            coupling: 0.0,
+            heater_loss: 0.0,
+            sample_loss: 0.0,
+            heater_radiation: 0.0,
+            sample_radiation: 0.0,
+            ..parameters()
+        };
+
+        let state = ThermalState {
+            heater_temp: 20.0,
+            sample_temp: 20.0,
+        };
+
+        let input = ThermalInput {
+            ambient_temp: 20.0,
+            heater_command: 0.5,
+        };
+
+        let next = rk2_step(state, params, input, 0.1);
+
+        assert!((next.heater_temp - 20.05).abs() < 1e-4);
+        assert_eq!(next.sample_temp, 20.0);
+    }
+
+    #[test]
+    fn internal_heat_exchange_conserves_energy() {
+        let params = ThermalParams {
+            heater_loss: 0.0,
+            sample_loss: 0.0,
+            heater_radiation: 0.0,
+            sample_radiation: 0.0,
+            ..parameters()
+        };
+
+        let state = ThermalState {
+            heater_temp: 40.0,
+            sample_temp: 20.0,
+        };
+
+        let input = ThermalInput {
+            ambient_temp: 20.0,
+            heater_command: 0.0,
+        };
+
+        let next = rk2_step(state, params, input, 0.1);
+
+        let energy_before =
+            params.heater_capacity * state.heater_temp + params.sample_capacity * state.sample_temp;
+
+        let energy_after =
+            params.heater_capacity * next.heater_temp + params.sample_capacity * next.sample_temp;
+
+        assert!(next.heater_temp < state.heater_temp);
+        assert!(next.sample_temp > state.sample_temp);
+        assert!((energy_after - energy_before).abs() < 0.01);
+    }
+    #[test]
+    fn heater_cools_after_power_off() {
+        let state = ThermalState {
+            heater_temp: 60.0,
+            sample_temp: 30.0,
+        };
+
+        let input = ThermalInput {
+            ambient_temp: 20.0,
+            heater_command: 0.0,
+        };
+
+        let next = rk2_step(state, parameters(), input, 0.1);
+
+        assert!(next.heater_temp < state.heater_temp);
+    }
+}
