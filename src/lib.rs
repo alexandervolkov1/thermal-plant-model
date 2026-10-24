@@ -31,7 +31,6 @@ pub struct ThermalInput {
     pub heater_command: f32,
 }
 
-/// Physical parameters and initial conditions for a simulation run.
 #[derive(Clone, Copy)]
 pub struct SimulationConfig {
     pub parameters: ThermalParams,
@@ -103,6 +102,50 @@ impl SimulationConfig {
         }
 
         Ok(())
+    }
+}
+
+pub const MODEL_STEP_SECONDS: f32 = 0.1;
+
+pub struct ThermalPlant {
+    parameters: ThermalParams,
+    state: ThermalState,
+    input: ThermalInput,
+}
+
+impl ThermalPlant {
+    pub fn new(config: SimulationConfig) -> Result<Self, &'static str> {
+        config.validate()?;
+
+        Ok(Self {
+            parameters: config.parameters,
+            state: config.initial_state,
+            input: ThermalInput {
+                background_temp: config.background_temp,
+                heater_command: 0.0,
+            },
+        })
+    }
+
+    pub fn temperatures(&self) -> ThermalState {
+        self.state
+    }
+
+    pub fn power_percent(&self) -> f32 {
+        self.input.heater_command * 100.0
+    }
+
+    pub fn set_power_percent(&mut self, power: f32) -> Result<(), &'static str> {
+        if !power.is_finite() || !(0.0..=100.0).contains(&power) {
+            return Err("Heater power must be between 0 and 100 percent");
+        }
+
+        self.input.heater_command = power / 100.0;
+        Ok(())
+    }
+
+    pub fn step(&mut self) {
+        self.state = rk2_step(self.state, self.parameters, self.input, MODEL_STEP_SECONDS);
     }
 }
 
@@ -399,5 +442,54 @@ mod tests {
         config.parameters.coupling = 2.0;
         config.background_temp = f32::NAN;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn plant_step_matches_rk2() {
+        let config = SimulationConfig::default();
+
+        let mut plant = ThermalPlant::new(config).unwrap();
+        plant.set_power_percent(50.0).unwrap();
+
+        let expected = rk2_step(
+            config.initial_state,
+            config.parameters,
+            ThermalInput {
+                background_temp: config.background_temp,
+                heater_command: 0.5,
+            },
+            MODEL_STEP_SECONDS,
+        );
+
+        plant.step();
+
+        let actual = plant.temperatures();
+
+        assert_eq!(actual.heater_temp, expected.heater_temp);
+        assert_eq!(actual.sample_temp, expected.sample_temp);
+        assert_eq!(actual.room_temp, expected.room_temp);
+    }
+
+    #[test]
+    fn rejects_invalid_power() {
+        let mut plant = ThermalPlant::new(SimulationConfig::default()).unwrap();
+
+        plant.set_power_percent(50.0).unwrap();
+
+        assert_eq!(plant.power_percent(), 50.0);
+
+        for invalid in [-1.0, 101.0, f32::NAN, f32::INFINITY] {
+            assert!(plant.set_power_percent(invalid).is_err());
+            assert_eq!(plant.power_percent(), 50.0);
+        }
+    }
+
+    #[test]
+    fn plant_rejects_invalid_configuration() {
+        let mut config = SimulationConfig::default();
+
+        config.parameters.room_capacity = -100.0;
+
+        assert!(ThermalPlant::new(config).is_err());
     }
 }
