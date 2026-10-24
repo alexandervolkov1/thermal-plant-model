@@ -1,5 +1,11 @@
 #![no_std]
 
+mod random;
+
+use random::XorShift32;
+
+pub const MODEL_STEP_SECONDS: f32 = 0.1;
+
 #[derive(Clone, Copy)]
 pub struct ThermalState {
     pub heater_temp: f32,
@@ -36,6 +42,8 @@ pub struct SimulationConfig {
     pub parameters: ThermalParams,
     pub initial_state: ThermalState,
     pub background_temp: f32,
+    pub seed: u32,
+    pub parameter_spread: f32,
 }
 
 impl Default for SimulationConfig {
@@ -59,6 +67,8 @@ impl Default for SimulationConfig {
                 room_temp: 20.0,
             },
             background_temp: 20.0,
+            seed: 1,
+            parameter_spread: 0.0,
         }
     }
 }
@@ -101,11 +111,40 @@ impl SimulationConfig {
             return Err("Temperatures must be finite and above absolute zero");
         }
 
+        if !(0.0..=0.10).contains(&self.parameter_spread) {
+            return Err("Parameter spread must be between 0 and 0.10");
+        }
+
         Ok(())
     }
 }
 
-pub const MODEL_STEP_SECONDS: f32 = 0.1;
+fn vary_parameters(nominal: ThermalParams, seed: u32, spread: f32) -> ThermalParams {
+    if spread == 0.0 {
+        return nominal;
+    }
+
+    let mut rng = XorShift32::new(seed);
+
+    let mut vary = |value: f32| value * (1.0 + spread * rng.next_signed_unit());
+
+    ThermalParams {
+        heater_capacity: vary(nominal.heater_capacity),
+        sample_capacity: vary(nominal.sample_capacity),
+        room_capacity: vary(nominal.room_capacity),
+
+        coupling: vary(nominal.coupling),
+
+        heater_loss: vary(nominal.heater_loss),
+        sample_loss: vary(nominal.sample_loss),
+        room_loss: vary(nominal.room_loss),
+
+        heater_radiation: vary(nominal.heater_radiation),
+        sample_radiation: vary(nominal.sample_radiation),
+
+        max_heater_power: vary(nominal.max_heater_power),
+    }
+}
 
 pub struct ThermalPlant {
     parameters: ThermalParams,
@@ -117,8 +156,16 @@ impl ThermalPlant {
     pub fn new(config: SimulationConfig) -> Result<Self, &'static str> {
         config.validate()?;
 
+        let parameters = vary_parameters(config.parameters, config.seed, config.parameter_spread);
+
+        SimulationConfig {
+            parameters,
+            ..config
+        }
+        .validate()?;
+
         Ok(Self {
-            parameters: config.parameters,
+            parameters,
             state: config.initial_state,
             input: ThermalInput {
                 background_temp: config.background_temp,
@@ -491,5 +538,78 @@ mod tests {
         config.parameters.room_capacity = -100.0;
 
         assert!(ThermalPlant::new(config).is_err());
+    }
+
+    #[test]
+    fn parameter_variation_is_reproducible() {
+        let config = SimulationConfig {
+            seed: 12345,
+            parameter_spread: 0.03,
+            ..SimulationConfig::default()
+        };
+
+        let mut first = ThermalPlant::new(config).unwrap();
+        let mut second = ThermalPlant::new(config).unwrap();
+
+        first.set_power_percent(75.0).unwrap();
+        second.set_power_percent(75.0).unwrap();
+
+        for _ in 0..1000 {
+            first.step();
+            second.step();
+        }
+
+        let a = first.temperatures();
+        let b = second.temperatures();
+
+        assert_eq!(a.heater_temp.to_bits(), b.heater_temp.to_bits());
+        assert_eq!(a.sample_temp.to_bits(), b.sample_temp.to_bits());
+        assert_eq!(a.room_temp.to_bits(), b.room_temp.to_bits());
+    }
+
+    #[test]
+    fn different_seeds_change_parameters() {
+        let mut config = SimulationConfig {
+            seed: 12345,
+            parameter_spread: 0.03,
+            ..SimulationConfig::default()
+        };
+
+        let first = ThermalPlant::new(config).unwrap();
+
+        config.seed = 67890;
+
+        let second = ThermalPlant::new(config).unwrap();
+
+        assert_ne!(
+            first.parameters.heater_capacity.to_bits(),
+            second.parameters.heater_capacity.to_bits()
+        );
+    }
+
+    #[test]
+    fn zero_spread_preserves_nominal_parameters() {
+        let config = SimulationConfig {
+            seed: 98765,
+            parameter_spread: 0.0,
+            ..SimulationConfig::default()
+        };
+
+        let plant = ThermalPlant::new(config).unwrap();
+
+        assert_eq!(
+            plant.parameters.heater_capacity,
+            config.parameters.heater_capacity
+        );
+
+        assert_eq!(
+            plant.parameters.sample_capacity,
+            config.parameters.sample_capacity
+        );
+
+        assert_eq!(
+            plant.parameters.room_capacity,
+            config.parameters.room_capacity
+        );
     }
 }
