@@ -7,6 +7,7 @@ use random::XorShift32;
 pub const MODEL_STEP_SECONDS: f32 = 0.1;
 const POWER_TARGET_INTERVAL_STEPS: u16 = 100;
 const POWER_SMOOTHING: f32 = 0.01;
+const SENSOR_SAMPLE_INTERVAL_STEPS: u8 = 10;
 
 #[derive(Clone, Copy)]
 pub struct ThermalState {
@@ -47,6 +48,7 @@ pub struct SimulationConfig {
     pub seed: u32,
     pub parameter_spread: f32,
     pub heater_power_fluctuation: f32,
+    pub sensor_noise: f32,
 }
 
 impl Default for SimulationConfig {
@@ -73,6 +75,7 @@ impl Default for SimulationConfig {
             seed: 1,
             parameter_spread: 0.0,
             heater_power_fluctuation: 0.0,
+            sensor_noise: 0.0,
         }
     }
 }
@@ -123,6 +126,10 @@ impl SimulationConfig {
             return Err("Heater power fluctuation must be between 0 and 0.10");
         }
 
+        if !(0.0..=2.0).contains(&self.sensor_noise) {
+            return Err("Sensor noise must be between 0 and 2 degrees Celsius");
+        }
+
         Ok(())
     }
 }
@@ -154,6 +161,18 @@ fn vary_parameters(nominal: ThermalParams, seed: u32, spread: f32) -> ThermalPar
     }
 }
 
+fn sample_temperatures(true_state: ThermalState, noise: f32, rng: &mut XorShift32) -> ThermalState {
+    if noise == 0.0 {
+        return true_state;
+    }
+
+    ThermalState {
+        heater_temp: true_state.heater_temp + noise * rng.next_signed_unit(),
+        sample_temp: true_state.sample_temp + noise * rng.next_signed_unit(),
+        room_temp: true_state.room_temp + noise * rng.next_signed_unit(),
+    }
+}
+
 pub struct ThermalPlant {
     parameters: ThermalParams,
     state: ThermalState,
@@ -163,6 +182,10 @@ pub struct ThermalPlant {
     power_offset: f32,
     power_target: f32,
     steps_until_power_target: u16,
+    sensor_noise: f32,
+    sensor_rng: XorShift32,
+    measured_state: ThermalState,
+    steps_until_sensor_sample: u8,
 }
 
 impl ThermalPlant {
@@ -177,6 +200,11 @@ impl ThermalPlant {
         }
         .validate()?;
 
+        let mut sensor_rng = XorShift32::new(config.seed ^ 0xC2B2_AE35);
+
+        let measured_state =
+            sample_temperatures(config.initial_state, config.sensor_noise, &mut sensor_rng);
+
         Ok(Self {
             parameters,
             state: config.initial_state,
@@ -189,11 +217,19 @@ impl ThermalPlant {
             power_offset: 0.0,
             power_target: 0.0,
             steps_until_power_target: 0,
+            sensor_noise: config.sensor_noise,
+            sensor_rng,
+            measured_state,
+            steps_until_sensor_sample: SENSOR_SAMPLE_INTERVAL_STEPS,
         })
     }
 
     pub fn temperatures(&self) -> ThermalState {
         self.state
+    }
+
+    pub fn measured_temperatures(&self) -> ThermalState {
+        self.measured_state
     }
 
     pub fn power_percent(&self) -> f32 {
@@ -234,6 +270,15 @@ impl ThermalPlant {
             self.input,
             MODEL_STEP_SECONDS,
         );
+
+        self.steps_until_sensor_sample -= 1;
+
+        if self.steps_until_sensor_sample == 0 {
+            self.measured_state =
+                sample_temperatures(self.state, self.sensor_noise, &mut self.sensor_rng);
+
+            self.steps_until_sensor_sample = SENSOR_SAMPLE_INTERVAL_STEPS;
+        }
     }
 }
 
@@ -726,5 +771,108 @@ mod tests {
             first.temperatures().heater_temp.to_bits(),
             second.temperatures().heater_temp.to_bits()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_sensor_noise() {
+        for invalid in [-0.1, 2.1, f32::NAN, f32::INFINITY] {
+            let config = SimulationConfig {
+                sensor_noise: invalid,
+                ..SimulationConfig::default()
+            };
+
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn sensor_samples_once_per_second() {
+        let mut plant = ThermalPlant::new(SimulationConfig::default()).unwrap();
+
+        plant.set_power_percent(100.0).unwrap();
+
+        let initial = plant.measured_temperatures().heater_temp;
+
+        for _ in 0..9 {
+            plant.step();
+
+            assert_eq!(plant.measured_temperatures().heater_temp, initial);
+        }
+
+        plant.step();
+
+        assert!(plant.measured_temperatures().heater_temp > initial);
+
+        assert_eq!(
+            plant.measured_temperatures().heater_temp,
+            plant.temperatures().heater_temp
+        );
+    }
+
+    #[test]
+    fn sensor_read_count_does_not_change_results() {
+        let config = SimulationConfig {
+            seed: 12345,
+            parameter_spread: 0.03,
+            heater_power_fluctuation: 0.03,
+            sensor_noise: 0.2,
+            ..SimulationConfig::default()
+        };
+
+        let mut first = ThermalPlant::new(config).unwrap();
+        let mut second = ThermalPlant::new(config).unwrap();
+
+        first.set_power_percent(75.0).unwrap();
+        second.set_power_percent(75.0).unwrap();
+
+        for _ in 0..600 {
+            let _ = first.measured_temperatures();
+            let _ = first.measured_temperatures();
+            let _ = first.measured_temperatures();
+
+            first.step();
+            second.step();
+        }
+
+        let a = first.measured_temperatures();
+        let b = second.measured_temperatures();
+
+        assert_eq!(a.heater_temp.to_bits(), b.heater_temp.to_bits());
+        assert_eq!(a.sample_temp.to_bits(), b.sample_temp.to_bits());
+        assert_eq!(a.room_temp.to_bits(), b.room_temp.to_bits());
+    }
+
+    #[test]
+    fn sensor_noise_does_not_change_physics() {
+        let config = SimulationConfig {
+            seed: 98765,
+            parameter_spread: 0.03,
+            heater_power_fluctuation: 0.03,
+            sensor_noise: 0.2,
+            ..SimulationConfig::default()
+        };
+
+        let mut noisy = ThermalPlant::new(config).unwrap();
+
+        let mut noiseless = ThermalPlant::new(SimulationConfig {
+            sensor_noise: 0.0,
+            ..config
+        })
+        .unwrap();
+
+        noisy.set_power_percent(80.0).unwrap();
+        noiseless.set_power_percent(80.0).unwrap();
+
+        for _ in 0..600 {
+            noisy.step();
+            noiseless.step();
+        }
+
+        let a = noisy.temperatures();
+        let b = noiseless.temperatures();
+
+        assert_eq!(a.heater_temp.to_bits(), b.heater_temp.to_bits());
+        assert_eq!(a.sample_temp.to_bits(), b.sample_temp.to_bits());
+        assert_eq!(a.room_temp.to_bits(), b.room_temp.to_bits());
     }
 }
