@@ -8,6 +8,8 @@ pub const MODEL_STEP_SECONDS: f32 = 0.1;
 const POWER_TARGET_INTERVAL_STEPS: u16 = 100;
 const POWER_SMOOTHING: f32 = 0.01;
 const SENSOR_SAMPLE_INTERVAL_STEPS: u8 = 10;
+const DRIFT_TARGET_INTERVAL_SAMPLES: u16 = 300;
+const DRIFT_SMOOTHING: f32 = 0.002;
 
 #[derive(Clone, Copy)]
 pub struct ThermalState {
@@ -49,6 +51,7 @@ pub struct SimulationConfig {
     pub parameter_spread: f32,
     pub heater_power_fluctuation: f32,
     pub sensor_noise: f32,
+    pub sensor_drift_amplitude: f32,
 }
 
 impl Default for SimulationConfig {
@@ -76,6 +79,7 @@ impl Default for SimulationConfig {
             parameter_spread: 0.0,
             heater_power_fluctuation: 0.0,
             sensor_noise: 0.0,
+            sensor_drift_amplitude: 0.0,
         }
     }
 }
@@ -128,6 +132,10 @@ impl SimulationConfig {
 
         if !(0.0..=2.0).contains(&self.sensor_noise) {
             return Err("Sensor noise must be between 0 and 2 degrees Celsius");
+        }
+
+        if !(0.0..=1.0).contains(&self.sensor_drift_amplitude) {
+            return Err("Sensor drift amplitude must be between 0 and 1 degree Celsius");
         }
 
         Ok(())
@@ -186,6 +194,11 @@ pub struct ThermalPlant {
     sensor_rng: XorShift32,
     measured_state: ThermalState,
     steps_until_sensor_sample: u8,
+    sensor_drift_amplitude: f32,
+    drift_rng: XorShift32,
+    drift_offset: ThermalState,
+    drift_target: ThermalState,
+    samples_until_drift_target: u16,
 }
 
 impl ThermalPlant {
@@ -205,6 +218,12 @@ impl ThermalPlant {
         let measured_state =
             sample_temperatures(config.initial_state, config.sensor_noise, &mut sensor_rng);
 
+        let zero_drift = ThermalState {
+            heater_temp: 0.0,
+            sample_temp: 0.0,
+            room_temp: 0.0,
+        };
+
         Ok(Self {
             parameters,
             state: config.initial_state,
@@ -221,6 +240,11 @@ impl ThermalPlant {
             sensor_rng,
             measured_state,
             steps_until_sensor_sample: SENSOR_SAMPLE_INTERVAL_STEPS,
+            sensor_drift_amplitude: config.sensor_drift_amplitude,
+            drift_rng: XorShift32::new(config.seed ^ 0x85EB_CA6B),
+            drift_offset: zero_drift,
+            drift_target: zero_drift,
+            samples_until_drift_target: 0,
         })
     }
 
@@ -243,6 +267,35 @@ impl ThermalPlant {
 
         self.input.heater_command = power / 100.0;
         Ok(())
+    }
+
+    fn update_sensor_drift(&mut self) {
+        if self.sensor_drift_amplitude == 0.0 {
+            return;
+        }
+
+        if self.samples_until_drift_target == 0 {
+            let amplitude = self.sensor_drift_amplitude;
+
+            self.drift_target = ThermalState {
+                heater_temp: amplitude * self.drift_rng.next_signed_unit(),
+                sample_temp: amplitude * self.drift_rng.next_signed_unit(),
+                room_temp: amplitude * self.drift_rng.next_signed_unit(),
+            };
+
+            self.samples_until_drift_target = DRIFT_TARGET_INTERVAL_SAMPLES;
+        }
+
+        self.samples_until_drift_target -= 1;
+
+        self.drift_offset.heater_temp +=
+            DRIFT_SMOOTHING * (self.drift_target.heater_temp - self.drift_offset.heater_temp);
+
+        self.drift_offset.sample_temp +=
+            DRIFT_SMOOTHING * (self.drift_target.sample_temp - self.drift_offset.sample_temp);
+
+        self.drift_offset.room_temp +=
+            DRIFT_SMOOTHING * (self.drift_target.room_temp - self.drift_offset.room_temp);
     }
 
     pub fn step(&mut self) {
@@ -274,8 +327,16 @@ impl ThermalPlant {
         self.steps_until_sensor_sample -= 1;
 
         if self.steps_until_sensor_sample == 0 {
-            self.measured_state =
+            self.update_sensor_drift();
+
+            let mut measured =
                 sample_temperatures(self.state, self.sensor_noise, &mut self.sensor_rng);
+
+            measured.heater_temp += self.drift_offset.heater_temp;
+            measured.sample_temp += self.drift_offset.sample_temp;
+            measured.room_temp += self.drift_offset.room_temp;
+
+            self.measured_state = measured;
 
             self.steps_until_sensor_sample = SENSOR_SAMPLE_INTERVAL_STEPS;
         }
@@ -874,5 +935,94 @@ mod tests {
         assert_eq!(a.heater_temp.to_bits(), b.heater_temp.to_bits());
         assert_eq!(a.sample_temp.to_bits(), b.sample_temp.to_bits());
         assert_eq!(a.room_temp.to_bits(), b.room_temp.to_bits());
+    }
+
+    #[test]
+    fn rejects_invalid_sensor_drift() {
+        for invalid in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            let config = SimulationConfig {
+                sensor_drift_amplitude: invalid,
+                ..SimulationConfig::default()
+            };
+
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn sensor_drift_is_reproducible() {
+        let config = SimulationConfig {
+            seed: 12345,
+            sensor_noise: 0.2,
+            sensor_drift_amplitude: 0.3,
+            ..SimulationConfig::default()
+        };
+
+        let mut first = ThermalPlant::new(config).unwrap();
+        let mut second = ThermalPlant::new(config).unwrap();
+
+        for _ in 0..6000 {
+            let _ = first.measured_temperatures();
+            let _ = first.measured_temperatures();
+
+            first.step();
+            second.step();
+        }
+
+        let a = first.measured_temperatures();
+        let b = second.measured_temperatures();
+
+        assert_eq!(a.heater_temp.to_bits(), b.heater_temp.to_bits());
+        assert_eq!(a.sample_temp.to_bits(), b.sample_temp.to_bits());
+        assert_eq!(a.room_temp.to_bits(), b.room_temp.to_bits());
+    }
+
+    #[test]
+    fn sensor_drift_does_not_change_physics() {
+        let config = SimulationConfig {
+            seed: 12345,
+            sensor_noise: 0.0,
+            sensor_drift_amplitude: 0.4,
+            ..SimulationConfig::default()
+        };
+
+        let mut drifting = ThermalPlant::new(config).unwrap();
+
+        let mut ideal = ThermalPlant::new(SimulationConfig {
+            sensor_drift_amplitude: 0.0,
+            ..config
+        })
+        .unwrap();
+
+        drifting.set_power_percent(75.0).unwrap();
+        ideal.set_power_percent(75.0).unwrap();
+
+        for _ in 0..6000 {
+            drifting.step();
+            ideal.step();
+        }
+
+        let actual = drifting.temperatures();
+        let ideal_actual = ideal.temperatures();
+        let measured = drifting.measured_temperatures();
+
+        assert_eq!(
+            actual.heater_temp.to_bits(),
+            ideal_actual.heater_temp.to_bits()
+        );
+        assert_eq!(
+            actual.sample_temp.to_bits(),
+            ideal_actual.sample_temp.to_bits()
+        );
+        assert_eq!(actual.room_temp.to_bits(), ideal_actual.room_temp.to_bits());
+
+        let offsets = [
+            measured.heater_temp - actual.heater_temp,
+            measured.sample_temp - actual.sample_temp,
+            measured.room_temp - actual.room_temp,
+        ];
+
+        assert!(offsets.iter().all(|offset| offset.abs() <= 0.4001));
+        assert!(offsets.iter().any(|offset| offset.abs() > 0.001));
     }
 }
